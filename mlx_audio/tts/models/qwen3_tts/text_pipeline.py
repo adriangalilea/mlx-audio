@@ -252,8 +252,9 @@ _UNITS: Dict[str, Dict[str, str]] = {
 # Masculine-form words that have feminine variants when they precede a
 # feminine noun. Used by _gender_concordance for Spanish — the most common
 # case is hundreds ("doscientos personas" → "doscientas personas") plus
-# the unit "uno" / "veintiuno" / etc. Only Spanish has this in our
-# language set so it's hardcoded here rather than a per-lang table.
+# the unit "uno" / "veintiuno" / "alguno" / "ninguno". Only Spanish has
+# this in our language set so it's hardcoded here rather than a per-lang
+# table.
 _ES_MASC_TO_FEM: Dict[str, str] = {
     "doscientos":   "doscientas",
     "trescientos":  "trescientas",
@@ -266,6 +267,40 @@ _ES_MASC_TO_FEM: Dict[str, str] = {
     "uno":          "una",
     "veintiún":     "veintiuna",
     "veintiuno":    "veintiuna",
+    "alguno":       "alguna",
+    "ninguno":      "ninguna",
+}
+
+# Apocope: words that drop their final -o (with optional accent shift) when
+# they precede a masculine singular noun. "tengo uno gigabit" → "tengo un
+# gigabit". This applies AFTER the gender-concordance check has decided
+# the next word is masculine — feminine cases use _ES_MASC_TO_FEM instead.
+# Only Spanish.
+_ES_APOCOPE: Dict[str, str] = {
+    "uno":       "un",
+    "veintiuno": "veintiún",
+    "alguno":    "algún",
+    "ninguno":   "ningún",
+}
+
+# Words that should NOT trigger apocope when they follow "uno" — typical
+# function words/prepositions/conjunctions where "uno" is being used as a
+# pronoun rather than a quantifier ("uno por uno", "uno de cada", "uno y
+# otro"). The list is conservative; false-negatives just leave "uno"
+# untouched, which is grammatically valid even if not always natural.
+_ES_APOCOPE_IDIOM_GUARDS: set = {
+    # conjunctions
+    "y", "o", "e", "u", "ni", "pero", "sino",
+    # prepositions
+    "a", "ante", "bajo", "con", "contra", "de", "desde", "durante", "en",
+    "entre", "hacia", "hasta", "mediante", "para", "por", "según", "sin",
+    "sobre", "tras",
+    # relative / interrogative
+    "que", "cual", "cuales",
+    # comparison / coordination
+    "como", "menos", "más",
+    # cardinal pronouns repeating
+    "uno", "una", "otro", "otra", "otros", "otras",
 }
 
 # Feminine nouns whose plural ends in "-es" rather than "-as", so the
@@ -789,13 +824,26 @@ def _gender_concordance(text: str, lang: str) -> str:
         gap = m.group(2)
         next_word = m.group(3)
         nw_lower = next_word.lower()
+        is_apocope_word = masc in _ES_APOCOPE
 
-        # Common masc nouns ending in -as: keep masculine ("trescientos días").
-        if nw_lower in _ES_FALSE_AS_FEM:
+        # Idiom guard for apocope words: "uno por uno", "uno de cada", etc.
+        # When the following word is a function word, "uno" stays as a
+        # pronoun and doesn't apocopate. Only applies to apocope words —
+        # the hundreds (doscientos, etc.) don't have this issue because
+        # they're never used as standalone pronouns.
+        if is_apocope_word and nw_lower in _ES_APOCOPE_IDIOM_GUARDS:
             return m.group(0)
 
-        # Explicit feminine nouns (typically -es endings where the suffix is
-        # ambiguous: "mujeres" fem vs "hombres" masc): apply concordance.
+        # Common masc nouns ending in -as: keep masculine for hundreds
+        # ("trescientos días"), but still apocopate uno-forms ("uno día"
+        # → "un día").
+        if nw_lower in _ES_FALSE_AS_FEM:
+            if is_apocope_word:
+                return f"{_ES_APOCOPE[masc]}{gap}{next_word}"
+            return m.group(0)
+
+        # Explicit feminine nouns (typically -es endings where the suffix
+        # is ambiguous: "mujeres" fem vs "hombres" masc): apply concordance.
         if nw_lower in _ES_FEM_ES_NOUNS:
             return f"{_ES_MASC_TO_FEM[masc]}{gap}{next_word}"
 
@@ -803,9 +851,18 @@ def _gender_concordance(text: str, lang: str) -> str:
         if nw_lower.endswith("as") and len(nw_lower) > 2:
             return f"{_ES_MASC_TO_FEM[masc]}{gap}{next_word}"
 
-        # Feminine singular for "uno"/"veintiún" before -a noun.
-        if masc in {"uno", "veintiún", "veintiuno"} and nw_lower.endswith("a"):
+        # Feminine singular: only meaningful for apocope words ("una hija"
+        # rather than "uno hija"). Hundreds always stay masculine before
+        # a singular -a noun (those are exceedingly rare anyway: "200 agua"
+        # is not idiomatic Spanish).
+        if is_apocope_word and nw_lower.endswith("a") and nw_lower not in _ES_FALSE_AS_FEM:
             return f"{_ES_MASC_TO_FEM[masc]}{gap}{next_word}"
+
+        # Default: assume next word is masculine. For apocope words,
+        # apply apocope (uno→un, veintiuno→veintiún, etc.). Hundreds stay
+        # as-is since there's nothing to apocopate on them.
+        if is_apocope_word:
+            return f"{_ES_APOCOPE[masc]}{gap}{next_word}"
 
         return m.group(0)
 
