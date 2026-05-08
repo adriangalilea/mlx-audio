@@ -429,15 +429,35 @@ def _expand_dates(text: str, lang: str) -> str:
 def _expand_times(text: str, lang: str) -> str:
     """Expand ``HH:MM`` (and ``HH:MM:SS``) to natural spoken form.
 
-    Spanish: ``HH:MM`` → ``HH y MM`` (omit ``y MM`` when MM == 00, since the
-    sentence usually has its own qualifier like "en punto"). Other languages:
-    same shape with their own conjunction.
+    Two passes:
+      1. Common fractional minutes (``:15``, ``:30``) get the natural phrase
+         a native speaker would use ("y media", "y cuarto" / "et quart" /
+         "e mezza" / "e meia"). Only applies when there are no seconds
+         (HH:MM:SS) — for full timestamps the natural readings break down.
+      2. Everything else falls back to ``HH<conjunction>MM``. When MM == 00
+         and there's no SS, only ``HH`` is emitted, since the surrounding
+         text usually has its own qualifier ("en punto", "o'clock").
 
-    The minute group must be exactly 2 digits to avoid clashing with non-time
-    constructs (``2:5`` is not a time; ``15:7`` is unusual). Hours are 0-29
-    to allow 24h schedules; out-of-range matches pass through unchanged.
+    German is intentionally NOT special-cased — German "halb elf" anchors
+    to the next hour (10:30 → "halb elf"), and getting that wrong is more
+    jarring than reading "zehn dreißig" verbatim.
+
+    The minute group must be exactly 2 digits to avoid clashing with
+    non-time constructs (``2:5`` is not a time; ``15:7`` is unusual).
+    Hours are 0-29 to allow 24h schedules; out-of-range matches pass
+    through unchanged.
     """
-    # Per-language conjunction. Reuse "and" by default.
+    # Per-language quarter/half phrases. The phrase already contains the
+    # connective ("y", "et", "e") so it's appended with a single space rather
+    # than via the join token below. Empty dict means "no special handling".
+    fractional = {
+        "spanish":    {15: "y cuarto", 30: "y media"},
+        "french":     {15: "et quart", 30: "et demie"},
+        "italian":    {15: "e un quarto", 30: "e mezza"},
+        "portuguese": {15: "e quinze",   30: "e meia"},
+    }.get(lang, {})
+
+    # Per-language conjunction for the fallback HH<join>MM form.
     join = {
         "spanish":    " y ",
         "english":    " ",
@@ -452,11 +472,11 @@ def _expand_times(text: str, lang: str) -> str:
         s = m.group(3)
         if not (0 <= h <= 29 and 0 <= mn <= 59):
             return m.group(0)
-        out = str(h)
-        if mn != 0:
-            out += f"{join}{mn:02d}"
-        elif s is None:
+        if mn == 0 and s is None:
             return str(h)
+        if mn in fractional and s is None:
+            return f"{h} {fractional[mn]}"
+        out = f"{h}{join}{mn:02d}"
         if s is not None:
             ss = int(s)
             if 0 <= ss <= 59:
