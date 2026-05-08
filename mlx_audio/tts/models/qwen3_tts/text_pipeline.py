@@ -37,6 +37,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import numpy as np
 
@@ -67,6 +68,72 @@ _NUM2WORDS_LANG: Dict[str, str] = {
     "japanese": "ja",
     "korean": "ko",
     "russian": "ru",
+}
+
+# Per-language word for the dot in vocalized hostnames ("example punto com")
+# and for the @ in vocalized email addresses ("foo arroba bar"). Distinct
+# from _DECIMAL_WORD which is what gets read for numeric decimals — Spanish
+# uses "punto" for URL dots but "coma" for decimal numbers. Native readers
+# really do say different words for the same character in different
+# contexts.
+_URL_DOT_WORD: Dict[str, str] = {
+    "spanish":    "punto",
+    "english":    "dot",
+    "french":     "point",
+    "german":     "Punkt",
+    "italian":    "punto",
+    "portuguese": "ponto",
+    "japanese":   "ドット",
+    "korean":     "점",
+    "chinese":    "点",
+    "russian":    "точка",
+}
+_AT_SIGN_WORD: Dict[str, str] = {
+    "spanish":    "arroba",
+    "english":    "at",
+    "french":     "arobase",
+    "german":     "at",
+    "italian":    "chiocciola",
+    "portuguese": "arroba",
+    "japanese":   "アット",
+    "korean":     "골뱅이",
+    "chinese":    "at",
+    "russian":    "собака",
+}
+
+# URL / email placeholder per language. Used for *complex* URLs only —
+# anything with a path, query, or fragment beyond the bare host. Stripping
+# the URL to empty would leave dangling sentences ("Más info en " with
+# nothing after); a placeholder keeps the grammar intact. Pass an empty
+# string to normalize_text(url_placeholder="") to strip instead, in which
+# case the empty-bracket cleanup pass also runs.
+#
+# Simple URLs (just a hostname, optional protocol, optional trailing slash)
+# bypass this and get vocalized directly: "www.example.com" reads
+# "w w w punto example punto com" so a listener can transcribe it back.
+_URL_PLACEHOLDER: Dict[str, str] = {
+    "spanish":    "enlace",
+    "english":    "link",
+    "french":     "lien",
+    "german":     "Link",
+    "italian":    "collegamento",
+    "portuguese": "ligação",
+    "japanese":   "リンク",
+    "korean":     "링크",
+    "chinese":    "链接",
+    "russian":    "ссылка",
+}
+_EMAIL_PLACEHOLDER: Dict[str, str] = {
+    "spanish":    "correo",
+    "english":    "email",
+    "french":     "courriel",
+    "german":     "E-Mail",
+    "italian":    "email",
+    "portuguese": "email",
+    "japanese":   "メール",
+    "korean":     "이메일",
+    "chinese":    "电子邮件",
+    "russian":    "адрес",
 }
 
 # Currency symbol → spoken word, per language. Symbols are matched both as
@@ -309,10 +376,120 @@ def _strip_emojis(text: str) -> str:
     return "".join(out)
 
 
-def _strip_urls(text: str) -> str:
-    """Remove URLs (http/https/www) and email addresses entirely."""
-    text = _URL_PATTERN.sub(" ", text)
-    text = _EMAIL_PATTERN.sub(" ", text)
+_EMPTY_BRACKETS = re.compile(r"\(\s*\)|\[\s*\]|\{\s*\}|<\s*>")
+_TRAILING_PUNCT = ".,;:!?)]}"
+
+
+def _vocalize_host(host: str, dot_word: str) -> str:
+    """Convert a hostname into a TTS-friendly spoken sequence.
+
+    Splits on dots and joins with the language's dot word
+    ("punto" / "dot" / "Punkt"). Segments matching well-known unpronounceable
+    prefixes ("www", "ftp", "smtp") are spelled out letter-by-letter so the
+    TTS reads them as letters rather than mangling the acronym.
+    """
+    spell_letterwise = {"www", "ftp", "smtp", "imap", "pop", "ssh", "http", "https"}
+    parts = host.split(".")
+    rendered = []
+    for p in parts:
+        if p.lower() in spell_letterwise:
+            rendered.append(" ".join(p.lower()))
+        else:
+            rendered.append(p)
+    return f" {dot_word} ".join(rendered)
+
+
+def _classify_url(matched: str) -> Tuple[bool, str]:
+    """Decide if a URL is "simple" (host only) and return its host.
+
+    Simple = no path beyond ``/``, no query, no fragment, no auth, no port.
+    Anything past the bare host belongs to the placeholder branch — listening
+    to "barra docs barra api versión uno" is not useful.
+    """
+    candidate = matched if "://" in matched else f"//{matched}"
+    try:
+        parsed = urlparse(candidate, scheme="http")
+    except ValueError:
+        return False, ""
+    netloc = parsed.netloc
+    # Strip port + auth from netloc for vocalization (also automatic disqualifier)
+    if "@" in netloc or ":" in netloc:
+        return False, ""
+    if not netloc:
+        return False, ""
+    is_simple = parsed.path in ("", "/") and not parsed.query and not parsed.fragment
+    return is_simple, netloc
+
+
+def _replace_urls(
+    text: str,
+    lang: str,
+    url_placeholder: Optional[str],
+    email_placeholder: Optional[str],
+) -> str:
+    """Replace URLs and emails with TTS-friendly forms.
+
+    Two paths:
+      - Simple URL (just a host, optionally with protocol or trailing /)
+        → drop the protocol and vocalize the host, joining segments with
+        the language's dot word and spelling out known acronym prefixes
+        ("www" → "w w w"). The listener can transcribe the URL back from
+        the audio.
+      - Complex URL (any path/query/fragment) → use a placeholder word.
+        Reading "barra docs interrogación q igual..." aloud is useless.
+
+    Emails are always vocalized: "foo arroba bar punto com". The email
+    placeholder is only used as a fallback if the @ split fails.
+
+    Trailing terminal punctuation captured by the greedy regex
+    ("https://example.com." matches the trailing dot too) is trimmed
+    before vocalization so it survives as part of the surrounding
+    sentence.
+
+    Pass an empty placeholder to bypass vocalization for that path
+    (force-strip mode); in that case empty bracket-pairs left behind
+    are cleaned up.
+    """
+    url_word = url_placeholder
+    email_word = email_placeholder
+    if url_word is None:
+        url_word = _URL_PLACEHOLDER.get(lang, _URL_PLACEHOLDER["english"])
+    if email_word is None:
+        email_word = _EMAIL_PLACEHOLDER.get(lang, _EMAIL_PLACEHOLDER["english"])
+
+    dot_word = _URL_DOT_WORD.get(lang, _URL_DOT_WORD["english"])
+    at_word = _AT_SIGN_WORD.get(lang, _AT_SIGN_WORD["english"])
+
+    def _split_trailing(matched: str) -> Tuple[str, str]:
+        trailing = ""
+        while matched and matched[-1] in _TRAILING_PUNCT:
+            trailing = matched[-1] + trailing
+            matched = matched[:-1]
+        return matched, trailing
+
+    def _replace_url(m: "re.Match[str]") -> str:
+        matched, trailing = _split_trailing(m.group(0))
+        # Force-strip mode (caller asked for empty placeholder)
+        if not url_word.strip():
+            return url_word + trailing
+        is_simple, host = _classify_url(matched)
+        if is_simple and host:
+            return _vocalize_host(host, dot_word) + trailing
+        return url_word + trailing
+
+    def _replace_email(m: "re.Match[str]") -> str:
+        matched, trailing = _split_trailing(m.group(0))
+        if not email_word.strip():
+            return email_word + trailing
+        local, sep, host = matched.partition("@")
+        if sep and host:
+            return f"{local} {at_word} {_vocalize_host(host, dot_word)}" + trailing
+        return email_word + trailing
+
+    text = _URL_PATTERN.sub(_replace_url, text)
+    text = _EMAIL_PATTERN.sub(_replace_email, text)
+    if not url_word.strip() or not email_word.strip():
+        text = _EMPTY_BRACKETS.sub("", text)
     return text
 
 
@@ -523,9 +700,19 @@ def _expand_numbers(text: str, lang: str) -> str:
 
     def _replace(m: "re.Match[str]") -> str:
         tok = m.group(0)
+        # Glue protection: when a digit run is glued to a trailing letter
+        # (e.g. "512GB", "100kg", "60Hz"), the bare expansion would produce
+        # "quinientos doceGB" with no audible space between the number and
+        # the unit. Detect this from the surrounding context and append a
+        # space to the words so the unit stays a separate spoken token.
+        end = m.end()
+        full = m.string
+        needs_trailing_space = end < len(full) and full[end].isalpha()
+
         # Single bare digit shortcut — keep cheap path
         if len(tok) == 1:
-            return _spell_int(int(tok))
+            words = _spell_int(int(tok))
+            return words + " " if needs_trailing_space else words
 
         if use_comma_decimal:
             # period = thousands, comma = decimal
@@ -566,13 +753,15 @@ def _expand_numbers(text: str, lang: str) -> str:
                 # Digit-by-digit for long fractions (mathematical reading)
                 frac_words = " ".join(_spell_int(int(c)) for c in frac_trimmed)
 
-            return f"{int_words} {decimal_word} {frac_words}"
+            words = f"{int_words} {decimal_word} {frac_words}"
+            return words + " " if needs_trailing_space else words
 
         # Pure integer
         try:
-            return _spell_int(int(normalized))
+            words = _spell_int(int(normalized))
         except ValueError:
             return tok
+        return words + " " if needs_trailing_space else words
 
     return _NUMBER.sub(_replace, text)
 
@@ -591,6 +780,8 @@ def normalize_text(
     strip_markdown: bool = True,
     expand_abbreviations: bool = True,
     expand_numbers: bool = True,
+    url_placeholder: Optional[str] = None,
+    email_placeholder: Optional[str] = None,
     extra_abbreviations: Optional[Dict[str, str]] = None,
 ) -> str:
     """Normalize text for TTS synthesis.
@@ -604,10 +795,17 @@ def normalize_text(
         text: Input text.
         lang: Qwen3-TTS language name (``spanish``, ``english``, ...).
         strip_emojis: Drop emoji and pictograph codepoints.
-        strip_urls: Drop URLs and email addresses.
+        strip_urls: Replace URLs and email addresses (see ``url_placeholder``
+            and ``email_placeholder`` for how).
         strip_markdown: Strip Markdown formatting markers (keeps inner text).
         expand_abbreviations: Apply the per-language abbreviation dictionary.
         expand_numbers: Expand digits and currency to spoken words.
+        url_placeholder: Word to replace URLs with. ``None`` (default) means
+            "use the per-language placeholder from ``_URL_PLACEHOLDER``"
+            ("enlace" / "link" / etc.). Pass an empty string to strip URLs;
+            in that case any empty bracket-pairs left behind are also removed.
+        email_placeholder: Same idea for email addresses, with its own
+            per-language defaults ("correo" / "email" / etc.).
         extra_abbreviations: Additional regex→replacement mappings applied
             after the built-in dictionary (typically domain glossaries from
             the consumer side).
@@ -618,7 +816,7 @@ def normalize_text(
     if strip_markdown:
         text = _strip_markdown(text)
     if strip_urls:
-        text = _strip_urls(text)
+        text = _replace_urls(text, lang, url_placeholder, email_placeholder)
     if strip_emojis:
         text = _strip_emojis(text)
     if expand_abbreviations:
