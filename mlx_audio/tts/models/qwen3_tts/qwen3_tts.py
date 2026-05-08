@@ -1387,9 +1387,22 @@ class Model(nn.Module):
         )
 
         if use_icl:
-            # ICL mode needs stronger repetition penalty to prevent code
-            # degeneration with long reference audio prefills
-            icl_rep_penalty = max(repetition_penalty, 1.5)
+            # Pass repetition_penalty through unchanged. Upstream used to
+            # force a 1.5 floor here ("ICL mode needs stronger repetition
+            # penalty to prevent code degeneration with long reference
+            # audio prefills") but that's overly aggressive for two of our
+            # use cases:
+            #   1. voice_profile= path: the reference is a fixed-length
+            #      baked tensor (~250 frames for a 20s clip), not a
+            #      runtime-supplied long prefill.
+            #   2. Even on the live ref_audio path, callers who know what
+            #      they're doing should be able to push the penalty below
+            #      1.5 to recover prosodic expressiveness — high
+            #      repetition_penalty doesn't just block token loops, it
+            #      also flattens pitch contours by penalizing repeated
+            #      melodic patterns.
+            # Callers who hit code degeneration on long ad-hoc references
+            # can set repetition_penalty=1.5 explicitly.
             yield from self._generate_icl(
                 text=text,
                 ref_audio=ref_audio,
@@ -1400,7 +1413,7 @@ class Model(nn.Module):
                 max_tokens=max_tokens,
                 top_k=top_k,
                 top_p=top_p,
-                repetition_penalty=icl_rep_penalty,
+                repetition_penalty=repetition_penalty,
                 verbose=verbose,
                 stream=stream,
                 streaming_interval=streaming_interval,
