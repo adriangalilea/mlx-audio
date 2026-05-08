@@ -383,6 +383,15 @@ _ABBREVIATIONS: Dict[str, Dict[str, str]] = {
         # expansion sounds overly formal for chat content. If a future use
         # case needs them, pass extra_abbreviations={r"\bS\.\s?A\.": ...}.
         r"\bvs\.": "contra",
+        # ISO-4217 currency codes that LLM output frequently produces in
+        # parens or alongside numbers ("$7,000 (USD)"). Expand to the
+        # spoken word; the bare-number expander handles the digits.
+        r"\bUSD\b": "dólares",
+        r"\bEUR\b": "euros",
+        r"\bGBP\b": "libras",
+        r"\bJPY\b": "yenes",
+        r"\bCNY\b": "yuanes",
+        r"\bCHF\b": "francos suizos",
     },
     "english": {
         r"\bMr\.": "Mister",
@@ -399,6 +408,12 @@ _ABBREVIATIONS: Dict[str, Dict[str, str]] = {
         r"\bU\.S\.A\.": "United States",
         r"\bU\.K\.": "United Kingdom",
         r"\bU\.S\.": "United States",
+        r"\bUSD\b": "dollars",
+        r"\bEUR\b": "euros",
+        r"\bGBP\b": "pounds",
+        r"\bJPY\b": "yen",
+        r"\bCNY\b": "yuan",
+        r"\bCHF\b": "Swiss francs",
     },
     "french": {
         r"\bM\.": "monsieur",
@@ -466,6 +481,20 @@ _DECIMAL_WORD: Dict[str, str] = {
     "japanese":   "テン",
     "korean":     "쩜",
     "chinese":    "点",
+}
+
+# "X or more" suffix per language for "1500+" → "1500 o más".
+_PLUS_SUFFIX_WORD: Dict[str, str] = {
+    "spanish":    "o más",
+    "english":    "or more",
+    "french":     "ou plus",
+    "german":     "oder mehr",
+    "italian":    "o più",
+    "portuguese": "ou mais",
+    "russian":    "или больше",
+    "japanese":   "以上",
+    "korean":     "이상",
+    "chinese":    "或更多",
 }
 
 # "X percent" expansion per language. Applied before number expansion so the
@@ -546,6 +575,19 @@ _DATE_DMY = re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b")
 _DATE_ISO = re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b")
 _TIME_HM = re.compile(r"\b(\d{1,2}):(\d{2})(?::(\d{2}))?\b")
 _PERCENT = re.compile(r"(\d+(?:[.,]\d+)*)\s*%")
+# "<digits>+" or "<digits>%+" written immediately after a number/percent
+# meaning "or more" / "and up" in user-facing copy ("$10,000+", "100%+").
+# The optional %? lets the plus-suffix run BEFORE the percent expander
+# without losing the % character; the percent expander runs afterward
+# on the captured group as usual. Lookahead excludes "++" and word
+# boundaries so "C++" / "Java++" stay intact.
+_PLUS_SUFFIX = re.compile(r"(\d+(?:[.,]\d+)*\s*%?)\+(?![\w+])")
+# Pure thousand-separator patterns. ASCII-only digit groups separated by
+# either ',' or '.' with EXACTLY 3 digits per group. Used in
+# _expand_numbers to disambiguate "7,000" vs "7,5" before applying the
+# locale-specific decimal rule.
+_THOUSANDS_COMMA = re.compile(r"^\d{1,3}(,\d{3})+$")
+_THOUSANDS_DOT   = re.compile(r"^\d{1,3}(\.\d{3})+$")
 
 # Number matcher. Matches digit runs with optional thousands separators and
 # decimal mark. The decimal/thousands convention differs by language and is
@@ -773,6 +815,20 @@ def _expand_percent(text: str, lang: str) -> str:
         # rule so it gets the idiomatic reading.
         text = re.sub(r"\b100\s*%(?!\d)", "cien por cien", text)
     return _PERCENT.sub(rf"\1 {word}", text)
+
+
+def _expand_plus_suffix(text: str, lang: str) -> str:
+    """Replace ``<digits>+`` with ``<digits> <or-more-word>``.
+
+    Common in copy LLMs produce — "$10,000+", "1500+ users", "10+
+    minutes". Without this the model reads the trailing "+" as a literal
+    "más" / "plus" or just stops short, both of which sound wrong.
+
+    Falls back to English when the language has no entry. The bare
+    number expander downstream handles the digit group.
+    """
+    word = _PLUS_SUFFIX_WORD.get(lang, _PLUS_SUFFIX_WORD["english"])
+    return _PLUS_SUFFIX.sub(rf"\1 {word}", text)
 
 
 def _expand_units(text: str, lang: str) -> str:
@@ -1039,7 +1095,19 @@ def _expand_numbers(text: str, lang: str) -> str:
             words = _spell_int(int(tok))
             return words + " " if needs_trailing_space else words
 
-        if use_comma_decimal:
+        # Thousand-only patterns first, regardless of language. "7,000"
+        # in Spanish text is almost certainly en-US thousands convention
+        # (LLMs produce currency this way: "$7,000"). Native Spanish for
+        # the decimal 7.5 is "7,5" — the 3-digit-after-comma pattern is
+        # essentially never a decimal in any locale. Same for periods
+        # ("1.234.567" in Spanish, "1.234.567" copied from Spanish into
+        # English). Detecting up-front avoids the float() conversion
+        # eating trailing zeros (7.000 → 7.0 → "siete").
+        if _THOUSANDS_COMMA.fullmatch(tok):
+            normalized = tok.replace(",", "")
+        elif _THOUSANDS_DOT.fullmatch(tok):
+            normalized = tok.replace(".", "")
+        elif use_comma_decimal:
             # period = thousands, comma = decimal
             normalized = tok.replace(".", "").replace(",", ".")
         else:
@@ -1152,11 +1220,18 @@ def normalize_text(
     if expand_numbers:
         # Order matters: compound expanders that consume "<digits><suffix>"
         # patterns must run before the bare number expander pulls digits
-        # apart. Then the bare number expander runs. Then the
-        # gender-concordance pass cleans up masc→fem before feminine-plural
-        # nouns ("quinientos personas" → "quinientas personas").
+        # apart. Plus-suffix runs BEFORE currency/percent because the "+"
+        # is glued to the digits/% — once currency or percent consumes its
+        # symbol the "+" gets orphaned and the plus-suffix regex can't
+        # match it back to the number ("$10,000+" → "10,000 dólares+"
+        # if currency runs first). After plus-suffix and the symbol
+        # expanders, the bare number expander handles remaining digits.
+        # The gender-concordance pass at the end cleans up masc→fem
+        # before feminine-plural nouns ("quinientos personas" →
+        # "quinientas personas").
         text = _expand_dates(text, lang)
         text = _expand_times(text, lang)
+        text = _expand_plus_suffix(text, lang)
         text = _expand_currency(text, lang)
         text = _expand_percent(text, lang)
         text = _expand_units(text, lang)
