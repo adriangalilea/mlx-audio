@@ -39,6 +39,7 @@ stt = [
 # TTS dependencies
 tts = [
     "mistral-common[audio]",
+    "num2words>=0.5.13",
     "sentencepiece>=0.2.0",
 ]
 
@@ -62,6 +63,7 @@ sts = [
 # Full installation (all features)
 all = [
     "mistral-common[audio]",
+    "num2words>=0.5.13",
     "sentencepiece>=0.2.0",
 
     "fastapi>=0.95.0",
