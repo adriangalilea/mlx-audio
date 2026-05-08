@@ -187,6 +187,13 @@ class Model(nn.Module):
 
         self._icl_cache = {}
 
+        # Named voice profile registry. Populated by register_voice(name, dict)
+        # — typically with a profile produced by bake_voice() and persisted via
+        # mx.save_safetensors. Each entry is a dict with keys
+        # {"ref_codes", "ref_text_ids", "speaker_embed"}.
+        # See the voice_profile= path in _prepare_icl_generation_inputs.
+        self._voice_profiles: Dict[str, Dict[str, mx.array]] = {}
+
     @property
     def sample_rate(self) -> int:
         return self._sample_rate
@@ -305,6 +312,99 @@ class Model(nn.Module):
         mx.eval(speaker_embedding)
 
         return speaker_embedding
+
+    def bake_voice(
+        self,
+        ref_audio: Union[str, mx.array],
+        ref_text: str,
+    ) -> Dict[str, mx.array]:
+        """Compute the voice profile tensors for a reference (audio, text) pair.
+
+        Pure function on the model (no state mutation). Runs the speech tokenizer
+        encoder, the chat-template tokenization, and the ECAPA-TDNN speaker
+        encoder once, and returns the resulting tensors. The caller is expected
+        to persist them via ``mx.save_safetensors(path, returned_dict)`` and load
+        them back at runtime via :meth:`register_voice`.
+
+        This is the build-time half of the voice-profile pipeline. Inference
+        never calls bake_voice — at runtime, voices are loaded from disk into
+        :attr:`_voice_profiles` and looked up by name.
+
+        Args:
+            ref_audio: Reference audio. File path (resolved via load_audio) or
+                pre-loaded waveform [samples] at ``self.sample_rate``.
+            ref_text: Transcript of ``ref_audio``. Used to seed the LM prefix.
+
+        Returns:
+            Dict with three keys, all mx.array, ready for mx.save_safetensors:
+              - ``ref_codes``       [1, num_quantizers, ref_time]
+              - ``ref_text_ids``    [1, ref_text_len]
+              - ``speaker_embed``   [1, enc_dim]
+        """
+        if self.tokenizer is None:
+            raise ValueError("Tokenizer not loaded. Call post_load_hook first.")
+        if self.speech_tokenizer is None or not self.speech_tokenizer.has_encoder:
+            raise ValueError("Speech tokenizer with encoder is required for bake_voice.")
+        if self.speaker_encoder is None:
+            raise ValueError("Speaker encoder not available for this model type.")
+
+        if isinstance(ref_audio, str):
+            audio = load_audio(ref_audio, sample_rate=self.sample_rate)
+        else:
+            audio = ref_audio
+        audio_for_spk = audio
+
+        # ref_codes: speech tokenizer expects [1, 1, samples]
+        if audio.ndim == 1:
+            audio_3d = audio[None, None, :]
+        elif audio.ndim == 2:
+            audio_3d = audio[None, :]
+        else:
+            audio_3d = audio
+        ref_codes = self.speech_tokenizer.encode(audio_3d)
+        mx.eval(ref_codes)
+
+        # ref_text_ids: same trimming as the live path so the cached tensor is
+        # plug-compatible with _prepare_icl_generation_inputs.
+        ref_chat = f"<|im_start|>assistant\n{ref_text}<|im_end|>\n"
+        ref_ids = mx.array(self.tokenizer.encode(ref_chat))[None, :]
+        ref_text_ids = ref_ids[:, 3:-2]
+        mx.eval(ref_text_ids)
+
+        speaker_embed = self.extract_speaker_embedding(audio_for_spk)
+
+        return {
+            "ref_codes": ref_codes,
+            "ref_text_ids": ref_text_ids,
+            "speaker_embed": speaker_embed,
+        }
+
+    def register_voice(self, name: str, profile: Dict[str, mx.array]) -> None:
+        """Register a baked voice profile under a name.
+
+        After registration, callers can pass ``voice_profile=name`` to
+        :meth:`generate` to use this profile instead of providing
+        (ref_audio, ref_text) on every call. The profile dict must contain the
+        three tensors produced by :meth:`bake_voice`.
+
+        Idempotent: re-registering the same name overwrites the previous entry.
+        """
+        required = {"ref_codes", "ref_text_ids", "speaker_embed"}
+        missing = required - profile.keys()
+        if missing:
+            raise ValueError(
+                f"voice profile {name!r} is missing required keys: {sorted(missing)}. "
+                f"Got: {sorted(profile.keys())}"
+            )
+        self._voice_profiles[name] = {k: profile[k] for k in required}
+
+    def unregister_voice(self, name: str) -> None:
+        """Remove a registered voice profile. No-op if not registered."""
+        self._voice_profiles.pop(name, None)
+
+    def list_voices(self) -> List[str]:
+        """Return the names of currently-registered voice profiles."""
+        return sorted(self._voice_profiles)
 
     def _prepare_generation_inputs(
         self,
@@ -586,9 +686,10 @@ class Model(nn.Module):
     def _prepare_icl_generation_inputs(
         self,
         text: str,
-        ref_audio: mx.array,
-        ref_text: str,
+        ref_audio: Optional[mx.array] = None,
+        ref_text: Optional[str] = None,
         language: str = "auto",
+        voice_profile: Optional[str] = None,
     ) -> Tuple[mx.array, mx.array, mx.array, mx.array]:
         """Prepare inputs for ICL (In-Context Learning) voice cloning.
 
@@ -599,9 +700,15 @@ class Model(nn.Module):
 
         Args:
             text: Target text to synthesize
-            ref_audio: Reference audio waveform [samples]
-            ref_text: Transcript of the reference audio
+            ref_audio: Reference audio waveform [samples]. Required unless
+                voice_profile is set.
+            ref_text: Transcript of the reference audio. Required unless
+                voice_profile is set.
             language: Language code
+            voice_profile: Name of a pre-baked voice profile (loaded via
+                model.load_voice). When set, ref_audio and ref_text are ignored
+                and the cached (ref_codes, ref_text_ids, speaker_embed) trio
+                is used directly — skipping all encode/tokenize/x-vector work.
 
         Returns:
             input_embeds: Input embeddings for prefill
@@ -611,15 +718,46 @@ class Model(nn.Module):
         """
         if self.tokenizer is None:
             raise ValueError("Tokenizer not loaded. Call post_load_hook first.")
+        if voice_profile is None and (ref_audio is None or ref_text is None):
+            raise ValueError(
+                "_prepare_icl_generation_inputs requires either voice_profile or "
+                "(ref_audio + ref_text)."
+            )
 
         config = self.config.talker_config
 
+        # Two paths to obtain (ref_codes, ref_text_ids, speaker_embed):
+        #   - voice_profile=<name>: look up named, pre-baked profile in
+        #     self._voice_profiles. Production path. Skips encode/tokenize/x-vector
+        #     entirely. Profiles are first-class assets registered via
+        #     register_voice() and typically built once via bake_voice() +
+        #     mx.save_safetensors.
+        #   - ref_audio + ref_text: legacy ad-hoc cloning. Hits the in-process
+        #     fingerprint cache (self._icl_cache) so repeat calls within a
+        #     process lifetime skip recomputation, but the first call still pays
+        #     the full encode + speaker-encoder cost.
+        # The two are intentionally orthogonal — _voice_profiles is for named
+        # identities, _icl_cache is opportunistic in-memory caching.
         ref_codes = None
         ref_text_ids = None
-        ref_audio_fingerprint = (ref_audio.size, float(ref_audio.sum()))
-        cache_key = (ref_text, ref_audio_fingerprint)
-        if cache_key in self._icl_cache:
-            ref_codes, ref_text_ids = self._icl_cache[cache_key]
+        speaker_embed = None
+        cache_key = None
+        if voice_profile is not None:
+            if voice_profile not in self._voice_profiles:
+                raise ValueError(
+                    f"voice_profile={voice_profile!r} not registered. "
+                    f"Call model.register_voice(name, profile) first. "
+                    f"Registered: {sorted(self._voice_profiles)}"
+                )
+            profile = self._voice_profiles[voice_profile]
+            ref_codes = profile["ref_codes"]
+            ref_text_ids = profile["ref_text_ids"]
+            speaker_embed = profile["speaker_embed"]
+        else:
+            ref_audio_fingerprint = (ref_audio.size, float(ref_audio.sum()))
+            cache_key = (ref_text, ref_audio_fingerprint)
+            if cache_key in self._icl_cache:
+                ref_codes, ref_text_ids, speaker_embed = self._icl_cache[cache_key]
 
         # 1. Encode reference audio -> ref_codes [1, 16, ref_time]
         audio_for_spk = ref_audio  # Save original shape for speaker embedding
@@ -639,9 +777,20 @@ class Model(nn.Module):
             # Pure ref text tokens: skip first 3 (role) and last 2 (<|im_end|>\n)
             ref_text_ids = ref_ids[:, 3:-2]
 
-        if cache_key not in self._icl_cache:
+        # 8. Speaker embedding (ICL still uses x-vector). Compute now so we can
+        # store it alongside ref_codes/ref_text_ids in the cache — speaker_embed
+        # is the most expensive piece (ECAPA-TDNN forward pass) and was previously
+        # recomputed on every call.
+        if speaker_embed is None and self.speaker_encoder is not None:
+            speaker_embed = self.extract_speaker_embedding(audio_for_spk)
+            mx.eval(speaker_embed)
+
+        # Persist into the in-memory fingerprint cache only on the legacy path.
+        # The voice_profile path doesn't write back — its data already lives in
+        # self._voice_profiles, owned by the registry.
+        if cache_key is not None and cache_key not in self._icl_cache:
             mx.eval(ref_text_ids)
-            self._icl_cache[cache_key] = (ref_codes, ref_text_ids)
+            self._icl_cache[cache_key] = (ref_codes, ref_text_ids, speaker_embed)
 
         # target_text format: <|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n
         target_chat = (
@@ -720,10 +869,7 @@ class Model(nn.Module):
             if language.lower() in config.codec_language_id:
                 language_id = config.codec_language_id[language.lower()]
 
-        # 8. Speaker embedding (ICL still uses x-vector)
-        speaker_embed = None
-        if self.speaker_encoder is not None:
-            speaker_embed = self.extract_speaker_embedding(audio_for_spk)
+        # (speaker_embed already computed and cached above, before _icl_cache write)
 
         # 9. Build codec prefix (think/nothink + speaker + pad + bos)
         if language_id is None:
@@ -1130,6 +1276,7 @@ class Model(nn.Module):
         lang_code: str = "auto",
         ref_audio: Optional[Union[str, mx.array]] = None,
         ref_text: Optional[str] = None,
+        voice_profile: Optional[str] = None,
         split_pattern: str = "\n",
         max_tokens: int = 4096,
         verbose: bool = False,
@@ -1139,6 +1286,7 @@ class Model(nn.Module):
         top_k: int = 50,
         top_p: float = 1.0,
         repetition_penalty: float = 1.05,
+        seed: Optional[int] = None,
         **kwargs,
     ) -> Generator[GenerationResult, None, None]:
         """Generate audio from text.
@@ -1169,6 +1317,12 @@ class Model(nn.Module):
         Yields:
             GenerationResult objects with generated audio
         """
+        # Pin the global PRNG so callers can reproduce a generation (or run
+        # regen-on-failure with a different seed). MLX has no per-call seed
+        # kwarg on its samplers — they read the global state.
+        if seed is not None:
+            mx.random.seed(seed)
+
         # Load reference audio if provided (handles file paths and mx.array)
         if ref_audio is not None:
             ref_audio = load_audio(ref_audio, sample_rate=self.sample_rate)
@@ -1223,11 +1377,13 @@ class Model(nn.Module):
         if self.speech_tokenizer is None:
             raise ValueError("Speech tokenizer not loaded")
 
-        # Check if we should use ICL mode
-        use_icl = (
-            ref_audio is not None
-            and ref_text is not None
-            and self.speech_tokenizer.has_encoder
+        # Check if we should use ICL mode. Two routes:
+        #   - Pre-baked voice profile (voice_profile=name) — no need for
+        #     ref_audio/ref_text at call time, the profile already has them.
+        #   - Live ad-hoc cloning (ref_audio + ref_text).
+        use_icl = self.speech_tokenizer.has_encoder and (
+            voice_profile is not None
+            or (ref_audio is not None and ref_text is not None)
         )
 
         if use_icl:
@@ -1238,6 +1394,7 @@ class Model(nn.Module):
                 text=text,
                 ref_audio=ref_audio,
                 ref_text=ref_text,
+                voice_profile=voice_profile,
                 language=lang_code,
                 temperature=temperature,
                 max_tokens=max_tokens,
@@ -2197,8 +2354,9 @@ class Model(nn.Module):
     def _generate_icl(
         self,
         text: str,
-        ref_audio: mx.array,
-        ref_text: str,
+        ref_audio: Optional[mx.array] = None,
+        ref_text: Optional[str] = None,
+        voice_profile: Optional[str] = None,
         language: str = "auto",
         temperature: float = 0.9,
         max_tokens: int = 4096,
@@ -2215,6 +2373,9 @@ class Model(nn.Module):
         Encodes reference audio through the speech tokenizer encoder, uses the
         encoded codes as context for generation, then prepends them to the
         generated codes for decoding.
+
+        When ``voice_profile`` is set, the encode step is skipped and the
+        pre-baked tensors registered under that name are used directly.
         """
         start_time = time.time()
 
@@ -2228,6 +2389,7 @@ class Model(nn.Module):
                 ref_audio=ref_audio,
                 ref_text=ref_text,
                 language=language,
+                voice_profile=voice_profile,
             )
         )
 
