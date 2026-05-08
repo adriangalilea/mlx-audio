@@ -88,6 +88,25 @@ _URL_DOT_WORD: Dict[str, str] = {
     "chinese":    "点",
     "russian":    "точка",
 }
+# Letter names per language for letter-by-letter spelling (used inside
+# vocalized hostnames for "www" / "ftp" / etc.). When a language has no
+# entry, the letter is emitted bare and the TTS pronounces it however its
+# training picked up — fine for English ("dub-ya dub-ya dub-ya"), but
+# Spanish reads bare "w" as "uu" or worse, so we explicitly spell it as
+# "uve doble" (RAE official). Only entries that meaningfully differ from
+# the bare letter are populated; the rest fall through to bare emission.
+_LETTER_NAMES: Dict[str, Dict[str, str]] = {
+    "spanish": {
+        "a": "a",        "b": "be",       "c": "ce",       "d": "de",
+        "e": "e",        "f": "efe",      "g": "ge",       "h": "hache",
+        "i": "i",        "j": "jota",     "k": "ka",       "l": "ele",
+        "m": "eme",      "n": "ene",      "ñ": "eñe",      "o": "o",
+        "p": "pe",       "q": "cu",       "r": "erre",     "s": "ese",
+        "t": "te",       "u": "u",        "v": "uve",      "w": "uve doble",
+        "x": "equis",    "y": "ye",       "z": "zeta",
+    },
+}
+
 _AT_SIGN_WORD: Dict[str, str] = {
     "spanish":    "arroba",
     "english":    "at",
@@ -151,6 +170,160 @@ _CURRENCY: Dict[str, Dict[str, str]] = {
     "russian":    {"€": "евро",  "$": "долларов","£": "фунтов",    "¥": "иен"},
 }
 
+# Unit acronyms expanded to spoken words per language. Tricky boundary
+# semantics: "\b" alone matches between digit and letter, so "\bGB\b"
+# would FAIL to match "512GB" (the boundary is suppressed because both
+# '2' and 'G' are \w characters). We need letter-only lookbehind/
+# lookahead so the unit matches whether glued to digits ("512GB") or
+# standalone ("the GB drive"). Each entry below uses
+# (?<![a-zA-Z])UNIT(?![a-zA-Z]); replacements are prefixed with a space
+# so glued forms get a clean separator (the whitespace collapse pass
+# fixes any double-spaces in the standalone case).
+#
+# Order in the dict matters: longer/more-specific patterns must come
+# before shorter ones so "Mbps" doesn't get partially eaten by "MB".
+# Python 3.7+ preserves insertion order — this is intentional.
+#
+# Coverage is selective on purpose. Standalone single-letter units like
+# "g" (gramos) or "m" (metros) are too risky — they'd match inside or
+# adjacent to ordinary words. Only acronyms unambiguous in normal text
+# get expanded.
+_UNITS: Dict[str, Dict[str, str]] = {
+    "spanish": {
+        r"(?<![a-zA-Z])Mbps(?![a-zA-Z])": " megabits por segundo",
+        r"(?<![a-zA-Z])Gbps(?![a-zA-Z])": " gigabits por segundo",
+        r"(?<![a-zA-Z])Kbps(?![a-zA-Z])": " kilobits por segundo",
+        r"(?<![a-zA-Z])kWh(?![a-zA-Z])":  " kilovatios hora",
+        r"(?<![a-zA-Z])GHz(?![a-zA-Z])":  " gigahercios",
+        r"(?<![a-zA-Z])MHz(?![a-zA-Z])":  " megahercios",
+        r"(?<![a-zA-Z])kHz(?![a-zA-Z])":  " kilohercios",
+        r"(?<![a-zA-Z])RPM(?![a-zA-Z])":  " revoluciones por minuto",
+        r"(?<![a-zA-Z])FPS(?![a-zA-Z])":  " fotogramas por segundo",
+        r"(?<![a-zA-Z])DPI(?![a-zA-Z])":  " puntos por pulgada",
+        r"(?<![a-zA-Z])GB(?![a-zA-Z])":   " gigabytes",
+        r"(?<![a-zA-Z])MB(?![a-zA-Z])":   " megabytes",
+        r"(?<![a-zA-Z])KB(?![a-zA-Z])":   " kilobytes",
+        r"(?<![a-zA-Z])TB(?![a-zA-Z])":   " terabytes",
+        r"(?<![a-zA-Z])PB(?![a-zA-Z])":   " petabytes",
+        r"(?<![a-zA-Z])MP(?![a-zA-Z])":   " megapíxeles",
+        r"(?<![a-zA-Z])kW(?![a-zA-Z])":   " kilovatios",
+        r"(?<![a-zA-Z])MW(?![a-zA-Z])":   " megavatios",
+        r"(?<![a-zA-Z])GW(?![a-zA-Z])":   " gigavatios",
+        r"(?<![a-zA-Z])Hz(?![a-zA-Z])":   " hercios",
+        r"(?<![a-zA-Z])kg(?![a-zA-Z])":   " kilogramos",
+        r"(?<![a-zA-Z])mg(?![a-zA-Z])":   " miligramos",
+        r"(?<![a-zA-Z])ml(?![a-zA-Z])":   " mililitros",
+        r"(?<![a-zA-Z])km(?![a-zA-Z])":   " kilómetros",
+        r"(?<![a-zA-Z])cm(?![a-zA-Z])":   " centímetros",
+        r"(?<![a-zA-Z])mm(?![a-zA-Z])":   " milímetros",
+        r"(?<![a-zA-Z])ms(?![a-zA-Z])":   " milisegundos",
+    },
+    "english": {
+        r"(?<![a-zA-Z])Mbps(?![a-zA-Z])": " megabits per second",
+        r"(?<![a-zA-Z])Gbps(?![a-zA-Z])": " gigabits per second",
+        r"(?<![a-zA-Z])Kbps(?![a-zA-Z])": " kilobits per second",
+        r"(?<![a-zA-Z])kWh(?![a-zA-Z])":  " kilowatt-hours",
+        r"(?<![a-zA-Z])GHz(?![a-zA-Z])":  " gigahertz",
+        r"(?<![a-zA-Z])MHz(?![a-zA-Z])":  " megahertz",
+        r"(?<![a-zA-Z])kHz(?![a-zA-Z])":  " kilohertz",
+        r"(?<![a-zA-Z])RPM(?![a-zA-Z])":  " revolutions per minute",
+        r"(?<![a-zA-Z])FPS(?![a-zA-Z])":  " frames per second",
+        r"(?<![a-zA-Z])DPI(?![a-zA-Z])":  " dots per inch",
+        r"(?<![a-zA-Z])GB(?![a-zA-Z])":   " gigabytes",
+        r"(?<![a-zA-Z])MB(?![a-zA-Z])":   " megabytes",
+        r"(?<![a-zA-Z])KB(?![a-zA-Z])":   " kilobytes",
+        r"(?<![a-zA-Z])TB(?![a-zA-Z])":   " terabytes",
+        r"(?<![a-zA-Z])PB(?![a-zA-Z])":   " petabytes",
+        r"(?<![a-zA-Z])MP(?![a-zA-Z])":   " megapixels",
+        r"(?<![a-zA-Z])kW(?![a-zA-Z])":   " kilowatts",
+        r"(?<![a-zA-Z])MW(?![a-zA-Z])":   " megawatts",
+        r"(?<![a-zA-Z])GW(?![a-zA-Z])":   " gigawatts",
+        r"(?<![a-zA-Z])Hz(?![a-zA-Z])":   " hertz",
+        r"(?<![a-zA-Z])kg(?![a-zA-Z])":   " kilograms",
+        r"(?<![a-zA-Z])mg(?![a-zA-Z])":   " milligrams",
+        r"(?<![a-zA-Z])ml(?![a-zA-Z])":   " milliliters",
+        r"(?<![a-zA-Z])km(?![a-zA-Z])":   " kilometers",
+        r"(?<![a-zA-Z])cm(?![a-zA-Z])":   " centimeters",
+        r"(?<![a-zA-Z])mm(?![a-zA-Z])":   " millimeters",
+        r"(?<![a-zA-Z])ms(?![a-zA-Z])":   " milliseconds",
+    },
+}
+
+# Masculine-form words that have feminine variants when they precede a
+# feminine noun. Used by _gender_concordance for Spanish — the most common
+# case is hundreds ("doscientos personas" → "doscientas personas") plus
+# the unit "uno" / "veintiuno" / etc. Only Spanish has this in our
+# language set so it's hardcoded here rather than a per-lang table.
+_ES_MASC_TO_FEM: Dict[str, str] = {
+    "doscientos":   "doscientas",
+    "trescientos":  "trescientas",
+    "cuatrocientos":"cuatrocientas",
+    "quinientos":   "quinientas",
+    "seiscientos":  "seiscientas",
+    "setecientos":  "setecientas",
+    "ochocientos":  "ochocientas",
+    "novecientos":  "novecientas",
+    "uno":          "una",
+    "veintiún":     "veintiuna",
+    "veintiuno":    "veintiuna",
+}
+
+# Feminine nouns whose plural ends in "-es" rather than "-as", so the
+# suffix-based heuristic in _gender_concordance can't infer gender from
+# spelling alone (compare "mujeres" fem vs "hombres" masc, identical
+# suffix). When the next word after a masculine number is in this set we
+# apply concordance even though the suffix doesn't match.
+#
+# Bounded list — Spanish has a finite number of common feminine -es
+# nouns. Grows with audit findings; not exhaustive.
+_ES_FEM_ES_NOUNS: set = {
+    # singular (-e ending) — for "una/veintiuna" before fem singular
+    "mujer", "flor", "red", "ley", "luz", "voz", "raíz", "sal", "fe",
+    "miel", "piel", "edad", "ciudad", "verdad", "libertad", "vez",
+    "paz", "cruz", "nariz", "perdiz",
+    # plural (-es ending) — for hundreds before fem plural
+    "mujeres", "flores", "redes", "leyes", "luces", "voces", "raíces",
+    "sales", "veces", "paces", "cruces", "narices",
+    "edades", "ciudades", "verdades", "libertades",
+    "noches", "tardes", "clases", "bases", "claves",
+    "partes", "fuentes", "frases", "llaves", "naves",
+    "madres", "carnes", "muertes", "mentes", "fuentes",
+    "leches", "miel", "pieles", "fieles",
+    "aves",  # technically uses "el" in singular, fem otherwise
+}
+
+# Words that LOOK feminine plural (end in "-as") but aren't — masculine
+# nouns whose lemma happens to end in -a. The gender-concordance heuristic
+# would mis-fire on these ("trescientos días" is correct masc, not
+# "trescientas días"). The list is intentionally short: only nouns common
+# enough to come up in real text. Add to it as false positives surface.
+_ES_FALSE_AS_FEM: set = {
+    "día", "días",
+    "mapa", "mapas",
+    "problema", "problemas",
+    "tema", "temas",
+    "programa", "programas",
+    "clima", "climas",
+    "sistema", "sistemas",
+    "idioma", "idiomas",
+    "fantasma", "fantasmas",
+    "drama", "dramas",
+    "diagrama", "diagramas",
+    "planeta", "planetas",
+    "esquema", "esquemas",
+    "poeta", "poetas",
+    "cometa", "cometas",  # the celestial body — masc
+    "panorama", "panoramas",
+    "trauma", "traumas",
+    "diploma", "diplomas",
+    "axioma", "axiomas",
+    "carisma", "carismas",
+    "lema", "lemas",
+    "enigma", "enigmas",
+    "dilema", "dilemas",
+    "teorema", "teoremas",
+}
+
 # Per-language abbreviation expansion. Keys are word-boundary regex patterns,
 # values are spoken-form replacements. Conservative dictionaries — only the
 # expansions whose context is unambiguous regardless of surrounding text.
@@ -169,8 +342,11 @@ _ABBREVIATIONS: Dict[str, Dict[str, str]] = {
         r"\betc\.": "etcétera",
         r"\bp\.\s?ej\.": "por ejemplo",
         r"\bEE\.\s?UU\.": "Estados Unidos",
-        r"\bS\.\s?A\.": "sociedad anónima",
-        r"\bS\.\s?L\.": "sociedad limitada",
+        # Note: S.A. / S.L. intentionally NOT expanded — native speakers more
+        # often read them as letter sequences ("ese a", "ese ele") than as
+        # the full "sociedad anónima" / "sociedad limitada", and the
+        # expansion sounds overly formal for chat content. If a future use
+        # case needs them, pass extra_abbreviations={r"\bS\.\s?A\.": ...}.
         r"\bvs\.": "contra",
     },
     "english": {
@@ -316,7 +492,7 @@ _EMAIL_PATTERN = re.compile(
 # Markdown: handle code blocks first (they shadow inline patterns).
 _MD_CODE_BLOCK = re.compile(r"```[\s\S]*?```", re.MULTILINE)
 _MD_INLINE_CODE = re.compile(r"`+([^`]+)`+")
-_MD_LINK = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+_MD_LINK = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _MD_IMAGE = re.compile(r"!\[([^\]]*)\]\([^)]+\)")
 # Bold/italic/strike: keep inner text. Order matters: longest delim first.
 _MD_BOLD_ITALIC = re.compile(r"(\*\*\*|\*\*|\*|_{1,3}|~~)(.+?)\1")
@@ -380,20 +556,26 @@ _EMPTY_BRACKETS = re.compile(r"\(\s*\)|\[\s*\]|\{\s*\}|<\s*>")
 _TRAILING_PUNCT = ".,;:!?)]}"
 
 
-def _vocalize_host(host: str, dot_word: str) -> str:
+def _vocalize_host(host: str, dot_word: str, lang: str) -> str:
     """Convert a hostname into a TTS-friendly spoken sequence.
 
     Splits on dots and joins with the language's dot word
     ("punto" / "dot" / "Punkt"). Segments matching well-known unpronounceable
-    prefixes ("www", "ftp", "smtp") are spelled out letter-by-letter so the
-    TTS reads them as letters rather than mangling the acronym.
+    prefixes ("www", "ftp", "smtp") are spelled out letter-by-letter; the
+    per-language ``_LETTER_NAMES`` table is consulted so Spanish "www"
+    renders as "uve doble uve doble uve doble" instead of three bare 'w'
+    characters that the TTS reads as "wuwuwu" or worse.
     """
     spell_letterwise = {"www", "ftp", "smtp", "imap", "pop", "ssh", "http", "https"}
+    letter_names = _LETTER_NAMES.get(lang)
     parts = host.split(".")
     rendered = []
     for p in parts:
         if p.lower() in spell_letterwise:
-            rendered.append(" ".join(p.lower()))
+            if letter_names:
+                rendered.append(" ".join(letter_names.get(c.lower(), c) for c in p))
+            else:
+                rendered.append(" ".join(p.lower()))
         else:
             rendered.append(p)
     return f" {dot_word} ".join(rendered)
@@ -474,7 +656,7 @@ def _replace_urls(
             return url_word + trailing
         is_simple, host = _classify_url(matched)
         if is_simple and host:
-            return _vocalize_host(host, dot_word) + trailing
+            return _vocalize_host(host, dot_word, lang) + trailing
         return url_word + trailing
 
     def _replace_email(m: "re.Match[str]") -> str:
@@ -483,7 +665,7 @@ def _replace_urls(
             return email_word + trailing
         local, sep, host = matched.partition("@")
         if sep and host:
-            return f"{local} {at_word} {_vocalize_host(host, dot_word)}" + trailing
+            return f"{local} {at_word} {_vocalize_host(host, dot_word, lang)}" + trailing
         return email_word + trailing
 
     text = _URL_PATTERN.sub(_replace_url, text)
@@ -503,7 +685,12 @@ def _strip_markdown(text: str) -> str:
     """
     text = _MD_CODE_BLOCK.sub(" ", text)
     text = _MD_IMAGE.sub(r"\1", text)
-    text = _MD_LINK.sub(r"\1", text)
+    # Preserve both anchor text AND URL: "Visita [mi web](https://example.com)"
+    # used to drop the URL entirely. Now we keep "mi web https://example.com"
+    # and let the URL-replacement pass downstream vocalize the URL ("mi web
+    # example punto com"). Listeners can hear the link target — the same
+    # information a sighted reader gets from the rendered link.
+    text = _MD_LINK.sub(r"\1 \2", text)
     text = _MD_INLINE_CODE.sub(r"\1", text)
     text = _MD_BOLD_ITALIC.sub(r"\2", text)
     text = _MD_HEADING.sub("", text)
@@ -538,10 +725,91 @@ def _expand_percent(text: str, lang: str) -> str:
     """Replace ``N%`` with ``N <percent_word>`` so the bare digits get
     spelled out by the number-expansion pass that follows.
 
+    Spanish has an idiomatic exception: "100%" reads as "cien por cien",
+    not "cien por ciento" — both are technically valid but native speakers
+    consistently use the doubled form for exactly 100. Other percentages
+    (87%, 12,5%) take the regular "<n> por ciento" form.
+
     Falls back to English ("percent") when the language has no entry.
     """
     word = _PERCENT_WORD.get(lang, _PERCENT_WORD["english"])
+    if lang == "spanish":
+        # Match "100%" (whole-number 100, no decimals) before the generic
+        # rule so it gets the idiomatic reading.
+        text = re.sub(r"\b100\s*%(?!\d)", "cien por cien", text)
     return _PERCENT.sub(rf"\1 {word}", text)
+
+
+def _expand_units(text: str, lang: str) -> str:
+    """Expand unit acronyms (GB, kg, MHz, …) to their spoken word.
+
+    Runs *before* the bare-number expander so a glued form like "512GB"
+    becomes "512 gigabytes" first; the number expander then handles "512"
+    in isolation and produces "quinientos doce gigabytes" with the
+    expected space between number and unit.
+
+    Languages with no table fall through unchanged.
+    """
+    table = _UNITS.get(lang)
+    if not table:
+        return text
+    for pattern, replacement in table.items():
+        text = re.sub(pattern, replacement, text)
+    return text
+
+
+def _gender_concordance(text: str, lang: str) -> str:
+    """Apply masculine→feminine conversion before feminine-plural nouns (es).
+
+    Spanish numbers in 200..900 (and the standalone "uno") have a feminine
+    variant when they precede a feminine noun: ``trescientas mujeres``
+    rather than ``trescientos mujeres``. num2words doesn't know about the
+    surrounding noun, so we post-process the expanded text: when one of
+    these masculine words is immediately followed by what looks like a
+    feminine plural ("-as" ending), swap to the feminine form.
+
+    The heuristic mis-fires on masculine nouns that happen to end in
+    "-as" (días, problemas, sistemas, …). _ES_FALSE_AS_FEM lists the
+    common ones; words in that set are skipped.
+
+    Only Spanish is covered. Italian/French/Portuguese have similar but
+    much narrower concordance issues; add them per-language if the audit
+    surfaces a real failure.
+    """
+    if lang != "spanish":
+        return text
+
+    # The pattern matches a masculine word from our table followed by
+    # whitespace and another word. The "another word" decision is made in
+    # the callback so we can consult the false-positive set.
+    masc_pattern = r"\b(" + "|".join(re.escape(k) for k in _ES_MASC_TO_FEM) + r")\b(\s+)(\w+)"
+
+    def _swap(m: "re.Match[str]") -> str:
+        masc = m.group(1)
+        gap = m.group(2)
+        next_word = m.group(3)
+        nw_lower = next_word.lower()
+
+        # Common masc nouns ending in -as: keep masculine ("trescientos días").
+        if nw_lower in _ES_FALSE_AS_FEM:
+            return m.group(0)
+
+        # Explicit feminine nouns (typically -es endings where the suffix is
+        # ambiguous: "mujeres" fem vs "hombres" masc): apply concordance.
+        if nw_lower in _ES_FEM_ES_NOUNS:
+            return f"{_ES_MASC_TO_FEM[masc]}{gap}{next_word}"
+
+        # Feminine plural marker (-as): apply concordance.
+        if nw_lower.endswith("as") and len(nw_lower) > 2:
+            return f"{_ES_MASC_TO_FEM[masc]}{gap}{next_word}"
+
+        # Feminine singular for "uno"/"veintiún" before -a noun.
+        if masc in {"uno", "veintiún", "veintiuno"} and nw_lower.endswith("a"):
+            return f"{_ES_MASC_TO_FEM[masc]}{gap}{next_word}"
+
+        return m.group(0)
+
+    return re.sub(masc_pattern, _swap, text)
 
 
 def _expand_abbreviations(text: str, lang: str) -> str:
@@ -825,15 +1093,18 @@ def normalize_text(
             for pattern, replacement in extra_abbreviations.items():
                 text = re.sub(pattern, replacement, text)
     if expand_numbers:
-        # Order matters: dates/times/percent must consume their compound
-        # patterns *before* the bare number expander pulls digits apart.
-        # E.g. "10:30" must be matched as a single time, not as "10" and
-        # "30" separately joined by a literal colon.
+        # Order matters: compound expanders that consume "<digits><suffix>"
+        # patterns must run before the bare number expander pulls digits
+        # apart. Then the bare number expander runs. Then the
+        # gender-concordance pass cleans up masc→fem before feminine-plural
+        # nouns ("quinientos personas" → "quinientas personas").
         text = _expand_dates(text, lang)
         text = _expand_times(text, lang)
         text = _expand_currency(text, lang)
         text = _expand_percent(text, lang)
+        text = _expand_units(text, lang)
         text = _expand_numbers(text, lang)
+        text = _gender_concordance(text, lang)
 
     text = _WHITESPACE.sub(" ", text).strip()
     return text
