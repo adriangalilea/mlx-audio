@@ -288,14 +288,17 @@ def _strip_emojis(text: str) -> str:
 
     Uses the Unicode general-category database (``unicodedata``) so we don't
     need an external emoji table. ``So`` covers most emoji; ``Sk`` catches
-    skin-tone modifiers; we also drop variation selectors (U+FE00..FE0F),
-    zero-width joiner, and similar invisible glue codepoints that emoji
-    sequences are built from.
+    skin-tone modifiers; visible emoji codepoints are replaced with a space
+    so that "wow🔥cool" becomes "wow cool" rather than "wowcool" (the
+    surrounding whitespace cleanup pass will collapse runs back to one).
+    Variation selectors and zero-width glue codepoints are dropped silently —
+    they're invisible by definition and don't need a space replacement.
     """
     out: List[str] = []
     for c in text:
         cat = unicodedata.category(c)
         if cat in ("So", "Sk"):
+            out.append(" ")
             continue
         cp = ord(c)
         if 0xFE00 <= cp <= 0xFE0F:  # variation selectors
