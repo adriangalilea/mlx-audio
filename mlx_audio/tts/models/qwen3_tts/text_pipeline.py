@@ -173,6 +173,66 @@ _CHARS_PER_SEC: Dict[str, float] = {
     "chinese":    5.0,
 }
 
+# Decimal separator word per language. num2words' built-in float handling
+# defaults to "punto" / "point" / digit-by-digit, which is not how natives
+# read decimals — Spanish uses "coma", French uses "virgule", etc. We split
+# the integer and fractional parts ourselves and join with this word.
+_DECIMAL_WORD: Dict[str, str] = {
+    "spanish":    "coma",
+    "english":    "point",
+    "french":     "virgule",
+    "german":     "Komma",
+    "italian":    "virgola",
+    "portuguese": "vírgula",
+    "russian":    "запятая",
+    "japanese":   "テン",
+    "korean":     "쩜",
+    "chinese":    "点",
+}
+
+# "X percent" expansion per language. Applied before number expansion so the
+# bare digits get spelled out by num2words afterwards.
+_PERCENT_WORD: Dict[str, str] = {
+    "spanish":    "por ciento",
+    "english":    "percent",
+    "french":     "pour cent",
+    "german":     "Prozent",
+    "italian":    "per cento",
+    "portuguese": "por cento",
+    "russian":    "процентов",
+    "japanese":   "パーセント",
+    "korean":     "퍼센트",
+    "chinese":    "百分之",
+}
+
+# Month names for date expansion (numeric → spoken). Indexed 1..12.
+# Sentinel at index 0 keeps the access ergonomic.
+_MONTH_NAMES: Dict[str, List[str]] = {
+    "spanish": ["", "enero", "febrero", "marzo", "abril", "mayo", "junio",
+                "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"],
+    "english": ["", "January", "February", "March", "April", "May", "June",
+                "July", "August", "September", "October", "November", "December"],
+    "french":  ["", "janvier", "février", "mars", "avril", "mai", "juin",
+                "juillet", "août", "septembre", "octobre", "novembre", "décembre"],
+    "german":  ["", "Januar", "Februar", "März", "April", "Mai", "Juni",
+                "Juli", "August", "September", "Oktober", "November", "Dezember"],
+    "italian": ["", "gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno",
+                "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"],
+    "portuguese": ["", "janeiro", "fevereiro", "março", "abril", "maio", "junho",
+                   "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"],
+}
+
+# Date phrasing per language: how to glue "day {} month {} year" together.
+# Tuple: (between_day_and_month, between_month_and_year).
+_DATE_GLUE: Dict[str, Tuple[str, str]] = {
+    "spanish":    (" de ", " de "),
+    "english":    (" ", ", "),
+    "french":     (" ", " "),
+    "german":     (". ", " "),
+    "italian":    (" ", " "),
+    "portuguese": (" de ", " de "),
+}
+
 
 # ---------------------------------------------------------------------------
 # Compiled patterns (module-level so we don't recompile per call)
@@ -201,10 +261,21 @@ _MD_LIST_NUM = re.compile(r"^\s*\d+\.\s+", re.MULTILINE)
 
 _WHITESPACE = re.compile(r"\s+")
 
+# Compound patterns that must run BEFORE the bare number expander, because
+# they wrap multiple digit groups into a single linguistic unit (a date is
+# not three separate numbers, a time is not two separate numbers).
+_DATE_DMY = re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b")
+_DATE_ISO = re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b")
+_TIME_HM = re.compile(r"\b(\d{1,2}):(\d{2})(?::(\d{2}))?\b")
+_PERCENT = re.compile(r"(\d+(?:[.,]\d+)*)\s*%")
+
 # Number matcher. Matches digit runs with optional thousands separators and
 # decimal mark. The decimal/thousands convention differs by language and is
 # resolved per call in _expand_numbers.
 _NUMBER = re.compile(r"\d[\d.,]*\d|\d")
+
+# End-of-sentence punctuation we restore when abbreviation expansion eats it.
+_SENT_TERMINAL = ".!?"
 
 
 # ---------------------------------------------------------------------------
@@ -283,23 +354,132 @@ def _expand_currency(text: str, lang: str) -> str:
     return text
 
 
+def _expand_percent(text: str, lang: str) -> str:
+    """Replace ``N%`` with ``N <percent_word>`` so the bare digits get
+    spelled out by the number-expansion pass that follows.
+
+    Falls back to English ("percent") when the language has no entry.
+    """
+    word = _PERCENT_WORD.get(lang, _PERCENT_WORD["english"])
+    return _PERCENT.sub(rf"\1 {word}", text)
+
+
 def _expand_abbreviations(text: str, lang: str) -> str:
-    """Apply per-language abbreviation expansion (case-sensitive regex)."""
+    """Apply per-language abbreviation expansion, preserving final punctuation.
+
+    The abbreviation regex consumes its trailing period (``\\.`` is part of the
+    match), which would silently swallow end-of-sentence terminators —
+    "Vivo en EE.UU." → "Vivo en Estados Unidos" loses the ``.`` even though the
+    original ended a sentence. We capture the final terminator before the pass
+    and restore it afterward if the expansion ate it.
+    """
     table = _ABBREVIATIONS.get(lang)
     if not table:
         return text
+
+    stripped = text.rstrip()
+    final = stripped[-1] if stripped else ""
+    had_terminator = final in _SENT_TERMINAL
+    trailing_ws = text[len(stripped):] if had_terminator else ""
+
     for pattern, replacement in table.items():
         text = re.sub(pattern, replacement, text)
+
+    if had_terminator and not text.rstrip().endswith(final):
+        text = text.rstrip() + final + trailing_ws
+
     return text
+
+
+def _expand_dates(text: str, lang: str) -> str:
+    """Expand DD/MM/YYYY and YYYY-MM-DD date patterns to spoken form.
+
+    Only covers languages with a populated month name table; for the rest
+    the date passes through and gets read digit-group-by-digit-group.
+
+    DD/MM/YYYY is the European convention; the US would write MM/DD/YYYY.
+    Since we only run this normalizer when ``lang`` is set, and the languages
+    in our table all use DD/MM/YYYY, we don't try to disambiguate.
+    """
+    months = _MONTH_NAMES.get(lang)
+    if not months:
+        return text
+    sep_dm, sep_my = _DATE_GLUE.get(lang, (" ", " "))
+
+    def _expand_dmy(m: "re.Match[str]") -> str:
+        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if not (1 <= d <= 31 and 1 <= mo <= 12):
+            return m.group(0)
+        return f"{d}{sep_dm}{months[mo]}{sep_my}{y}"
+
+    def _expand_iso(m: "re.Match[str]") -> str:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if not (1 <= d <= 31 and 1 <= mo <= 12):
+            return m.group(0)
+        return f"{d}{sep_dm}{months[mo]}{sep_my}{y}"
+
+    text = _DATE_DMY.sub(_expand_dmy, text)
+    text = _DATE_ISO.sub(_expand_iso, text)
+    return text
+
+
+def _expand_times(text: str, lang: str) -> str:
+    """Expand ``HH:MM`` (and ``HH:MM:SS``) to natural spoken form.
+
+    Spanish: ``HH:MM`` → ``HH y MM`` (omit ``y MM`` when MM == 00, since the
+    sentence usually has its own qualifier like "en punto"). Other languages:
+    same shape with their own conjunction.
+
+    The minute group must be exactly 2 digits to avoid clashing with non-time
+    constructs (``2:5`` is not a time; ``15:7`` is unusual). Hours are 0-29
+    to allow 24h schedules; out-of-range matches pass through unchanged.
+    """
+    # Per-language conjunction. Reuse "and" by default.
+    join = {
+        "spanish":    " y ",
+        "english":    " ",
+        "french":     " ",
+        "german":     " ",
+        "italian":    " e ",
+        "portuguese": " e ",
+    }.get(lang, " ")
+
+    def _expand(m: "re.Match[str]") -> str:
+        h, mn = int(m.group(1)), int(m.group(2))
+        s = m.group(3)
+        if not (0 <= h <= 29 and 0 <= mn <= 59):
+            return m.group(0)
+        out = str(h)
+        if mn != 0:
+            out += f"{join}{mn:02d}"
+        elif s is None:
+            return str(h)
+        if s is not None:
+            ss = int(s)
+            if 0 <= ss <= 59:
+                out += f"{join}{ss:02d}"
+        return out
+
+    return _TIME_HM.sub(_expand, text)
 
 
 def _expand_numbers(text: str, lang: str) -> str:
     """Expand numeric tokens to spoken words via num2words.
 
     Resolves locale-specific separators: Spanish/German/French/Italian/
-    Portuguese use period for thousands and comma for decimal; English uses
-    the opposite. Falls back to leaving the original token in place if
-    parsing fails or num2words doesn't support the language.
+    Portuguese/Russian use period for thousands and comma for decimal;
+    English uses the opposite. Decimals are NOT delegated to num2words'
+    built-in float handling — that path tends to produce digit-by-digit
+    fractional readings ("cero punto siete cinco") instead of natural
+    cardinal readings ("cero coma setenta y cinco"). We split integer and
+    fractional parts ourselves and join with the language-specific
+    decimal word (see ``_DECIMAL_WORD``).
+
+    Fractional parts up to 3 digits get the cardinal reading
+    ("setenta y cinco"); longer ones default to digit-by-digit
+    ("uno cuatro uno cinco nueve") which is how mathematicians read them.
+
+    Tokens that fail to parse pass through unchanged.
     """
     if not _HAS_NUM2WORDS:
         return text
@@ -310,37 +490,65 @@ def _expand_numbers(text: str, lang: str) -> str:
     use_comma_decimal = lang in (
         "spanish", "german", "french", "italian", "portuguese", "russian"
     )
+    decimal_word = _DECIMAL_WORD.get(lang, "point")
+
+    def _spell_int(n: int) -> str:
+        try:
+            return num2words(n, lang=iso)
+        except (NotImplementedError, ValueError):
+            return str(n)
 
     def _replace(m: "re.Match[str]") -> str:
         tok = m.group(0)
         # Single bare digit shortcut — keep cheap path
         if len(tok) == 1:
-            try:
-                return num2words(int(tok), lang=iso)
-            except (NotImplementedError, ValueError):
-                return tok
+            return _spell_int(int(tok))
 
         if use_comma_decimal:
             # period = thousands, comma = decimal
-            cleaned = tok.replace(".", "").replace(",", ".")
+            normalized = tok.replace(".", "").replace(",", ".")
         else:
             # comma = thousands, period = decimal
-            cleaned = tok.replace(",", "")
+            normalized = tok.replace(",", "")
 
         # Reject ambiguous tokens (multiple decimal points after cleaning)
-        if cleaned.count(".") > 1:
+        if normalized.count(".") > 1:
             return tok
 
+        # Split integer/fractional parts manually — bypass num2words' float
+        # path so we control how the decimal joiner reads.
+        if "." in normalized:
+            int_part_str, frac_part_str = normalized.split(".", 1)
+            if not int_part_str:
+                int_part_str = "0"
+            try:
+                int_part = int(int_part_str)
+            except ValueError:
+                return tok
+
+            # Strip trailing zeros so "3,50" reads "tres coma cinco" not
+            # "tres coma cincuenta" (which would suggest 3,5 == 3,50).
+            # Note: this changes semantics. Disable if mathematical fidelity
+            # matters more than naturalness.
+            frac_trimmed = frac_part_str.rstrip("0") or "0"
+
+            int_words = _spell_int(int_part)
+            if len(frac_trimmed) <= 3:
+                # Cardinal reading for short fractions
+                try:
+                    frac_words = _spell_int(int(frac_trimmed))
+                except ValueError:
+                    return tok
+            else:
+                # Digit-by-digit for long fractions (mathematical reading)
+                frac_words = " ".join(_spell_int(int(c)) for c in frac_trimmed)
+
+            return f"{int_words} {decimal_word} {frac_words}"
+
+        # Pure integer
         try:
-            num = float(cleaned)
+            return _spell_int(int(normalized))
         except ValueError:
-            return tok
-
-        if num.is_integer():
-            num = int(num)
-        try:
-            return num2words(num, lang=iso)
-        except (NotImplementedError, ValueError):
             return tok
 
     return _NUMBER.sub(_replace, text)
@@ -396,7 +604,14 @@ def normalize_text(
             for pattern, replacement in extra_abbreviations.items():
                 text = re.sub(pattern, replacement, text)
     if expand_numbers:
+        # Order matters: dates/times/percent must consume their compound
+        # patterns *before* the bare number expander pulls digits apart.
+        # E.g. "10:30" must be matched as a single time, not as "10" and
+        # "30" separately joined by a literal colon.
+        text = _expand_dates(text, lang)
+        text = _expand_times(text, lang)
         text = _expand_currency(text, lang)
+        text = _expand_percent(text, lang)
         text = _expand_numbers(text, lang)
 
     text = _WHITESPACE.sub(" ", text).strip()
