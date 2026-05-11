@@ -2636,6 +2636,7 @@ class Model(nn.Module):
         full_codes = mx.concatenate([ref_codes_t, gen_codes], axis=1)
 
         ref_len = ref_codes.shape[2]
+        total_len = full_codes.shape[1]
 
         # Decode full codes to audio
         audio, audio_lengths = self.speech_tokenizer.decode(full_codes)
@@ -2646,18 +2647,21 @@ class Model(nn.Module):
         if valid_len > 0 and valid_len < audio.shape[0]:
             audio = audio[:valid_len]
 
-        # Remove the reference audio portion using the codec's exact
-        # samples-per-code ratio. The official implementation uses a
-        # proportional cut (``ref_len / total_len * total_samples``),
-        # which is fragile when the decoder's per-code sample count
-        # drifts at the boundary: a 1% drift shaves audible milliseconds
-        # off the FIRST WORD of the generation (well-documented
-        # listener complaint on AR TTS forks). The streaming path of
-        # this same model already uses the sample-accurate form via
-        # ``decode_upsample_rate`` (see ``_generate_with_instruct``
-        # below); we apply the same here so streaming and non-streaming
-        # produce byte-identical leading edges.
-        cut = ref_len * self.speech_tokenizer.decode_upsample_rate
+        # Remove the reference audio portion using a proportional cut.
+        # Tried ``ref_len * decode_upsample_rate`` (sample-accurate,
+        # matches the streaming chunk path) — it OVERCUTS in the
+        # non-streaming combined-decode case because the codec's
+        # convolutional decoder introduces edge effects on a single
+        # forward pass over [ref || gen]: actual output samples don't
+        # match ``total_len * upsample_rate`` exactly. The proportional
+        # form auto-adapts to whatever the decoder produces.
+        #
+        # The first-word clipping that prompted the sample-accurate
+        # experiment is real but separate — fix it at the input level
+        # with a head-pad ("." prefix) on the consumer side so the
+        # model emits a discardable lead-in that absorbs the cut. See
+        # ai-server `audio/stream.py` for the consumer-side patch.
+        cut = int(ref_len / max(total_len, 1) * audio.shape[0])
         if cut > 0 and cut < audio.shape[0]:
             audio = audio[cut:]
 
