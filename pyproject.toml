@@ -46,6 +46,7 @@ tts = [
 # Server dependencies
 server = [
     "fastapi>=0.95.0",
+    "starlette>=1.0.1",  # CVE-2026-48710 (BadHost)
     "uvicorn[standard]>=0.22.0",
     "python-multipart>=0.0.22",
     "webrtcvad>=2.0.10",
@@ -67,6 +68,7 @@ all = [
     "sentencepiece>=0.2.0",
 
     "fastapi>=0.95.0",
+    "starlette>=1.0.1",  # CVE-2026-48710 (BadHost)
     "uvicorn[standard]>=0.22.0",
 
     "webrtcvad>=2.0.10",
